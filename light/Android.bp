@@ -1,9 +1,17 @@
+//
+// Copyright (C) 2024-2026 The LineageOS Project
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
 cc_library_static {
     name: "libsensor-notifier-ext-light",
     vendor: true,
     srcs: [
+        "CwbClient.cpp",
         "RawLightNotifier.cpp",
         "SensorNotifierExt.cpp",
+        "UDalsBleedCompensator.cpp",
     ],
     shared_libs: [
         "libbase",
@@ -14,4 +22,14 @@ cc_library_static {
         "generated_kernel_headers",
         "//device/xiaomi/sm8450-common:xiaomi_sm8450_sensor_notifier_headers",
     ],
+    export_include_dirs: [
+        "include",
+    ],
+    cflags: [
+        "-Wall",
+        "-Werror",
+        "-Wextra",
+        "-Wno-unused-parameter",
+    ],
+    cpp_std: "c++20",
 }

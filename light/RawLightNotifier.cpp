@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 The LineageOS Project
+ * Copyright (C) 2024-2026 The LineageOS Project
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -8,7 +8,10 @@
 
 #include "RawLightNotifier.h"
 
+#include <android-base/file.h>
 #include <android-base/logging.h>
+#include <android-base/parseint.h>
+#include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 #include <display/drm/mi_disp.h>
 #include <poll.h>
@@ -30,31 +33,83 @@ namespace {
 
 class RawLightSensorCallback : public IEventQueueCallback {
   public:
-    Return<void> onEvent(const Event& e) {
-        _oem_msg msg;
-        msg.notifyType = REPORT_VALUE;
-        msg.value = e.u.vec4.y;
-        msg.notifyTypeFloat = msg.notifyType;
-        msg.unknown1 = 2;
-        msg.unknown2 = 5;
+    RawLightSensorCallback(std::shared_ptr<UDalsBleedCompensator> compensator)
+        : mCompensator(std::move(compensator)) {}
+
+    Return<void> onEvent(const Event& e) override {
+        float rawLux = e.u.vec4.y;
+        float compensatedLux = rawLux;
+
+        if (mCompensator != nullptr) {
+            bool shouldReport = mCompensator->compensate(rawLux, &compensatedLux);
+            if (!shouldReport) {
+                // Suppressed by hysteresis gate to reduce IPC jitter
+                return Void();
+            }
+        }
+
+        _oem_msg msg{};
         msg.sensorType = kSensorTypeAmbientlightRaw;
+        msg.notifyType = REPORT_VALUE;   // 201 (BOLED_DATA / SET_LUX)
+        msg.unknown1 = 2.0f;             // 2.0f = sensor event
+        msg.unknown2 = 5.0f;
+        msg.notifyTypeFloat = 201.0f;
+        msg.value = compensatedLux;
+        msg.cct = 0.0f;
 
         SscCalApiWrapper::getInstance().processMsg(&msg);
 
+        LOG(VERBOSE) << "UDALS event: raw=" << rawLux
+                     << " compensated=" << compensatedLux
+                     << " bleed=" << (rawLux - compensatedLux);
+
         return Void();
     }
+
+  private:
+    std::shared_ptr<UDalsBleedCompensator> mCompensator;
 };
+
+static uint32_t readPanelBacklight() {
+    static const char* const kBacklightPaths[] = {
+        "/sys/class/backlight/panel0-backlight/brightness",
+        "/sys/class/backlight/panel1-backlight/brightness",
+        nullptr
+    };
+    for (int i = 0; kBacklightPaths[i] != nullptr; ++i) {
+        std::string content;
+        if (android::base::ReadFileToString(kBacklightPaths[i], &content)) {
+            uint32_t bkl = 0;
+            if (android::base::ParseUint(android::base::Trim(content), &bkl)) {
+                return bkl;
+            }
+        }
+    }
+    return 0;
+}
 
 }  // namespace
 
-RawLightNotifier::RawLightNotifier(sp<ISensorManager> manager) : SensorNotifier(manager),
-                     isEnable(false) {
+RawLightNotifier::RawLightNotifier(sp<ISensorManager> manager)
+    : SensorNotifier(manager),
+      isEnable(false),
+      mCompensator(std::make_shared<UDalsBleedCompensator>()),
+      mCwbClient(std::make_unique<CwbClient>(mCompensator)) {
+    uint32_t initBkl = readPanelBacklight();
+    if (initBkl > 0 && mCompensator != nullptr) {
+        mCompensator->setBacklight(initBkl);
+    }
     initializeSensorQueue("xiaomi.sensor.ambientlight.factory", false,
-                          new RawLightSensorCallback());
+                          new RawLightSensorCallback(mCompensator));
+    LOG(INFO) << "RawLightNotifier initialized with UDALS screen-bleed compensator (seed backlight="
+              << initBkl << ")";
 }
 
 RawLightNotifier::~RawLightNotifier() {
     deactivate();
+    if (mCwbClient != nullptr) {
+        mCwbClient->stop();
+    }
 }
 
 void RawLightNotifier::notify() {
@@ -70,15 +125,24 @@ void RawLightNotifier::notify() {
     res = mQueue->enableSensor(mSensorHandle, 20000 /* sample period */, 0 /* latency */);
     if (res != Result::OK) {
         LOG(ERROR) << "failed to enable sensor";
-    } else isEnable = true;
+    } else {
+        isEnable = true;
+        if (mCwbClient != nullptr) {
+            mCwbClient->start();
+        }
+    }
 
-    // Register for power events
-    const std::vector<disp_event_type> notifyEvents = {MI_DISP_EVENT_POWER, MI_DISP_EVENT_FPS,
-                                                       MI_DISP_EVENT_51_BRIGHTNESS,
-                                                       MI_DISP_EVENT_HBM, MI_DISP_EVENT_DC};
+    // Register for display events
+    const std::vector<disp_event_type> notifyEvents = {
+        MI_DISP_EVENT_POWER,
+        MI_DISP_EVENT_FPS,
+        MI_DISP_EVENT_51_BRIGHTNESS,
+        MI_DISP_EVENT_HBM,
+        MI_DISP_EVENT_DC
+    };
 
     for (const disp_event_type& event : notifyEvents) {
-        disp_event_req req;
+        disp_event_req req{};
         req.base.flag = 0;
         req.base.disp_id = MI_DISP_PRIMARY;
         req.type = event;
@@ -86,11 +150,12 @@ void RawLightNotifier::notify() {
     }
 
     struct pollfd dispEventPoll = {
-            .fd = disp_fd_.get(),
-            .events = POLLIN,
+        .fd = disp_fd_.get(),
+        .events = POLLIN,
+        .revents = 0,
     };
 
-    _oem_msg* msg = new _oem_msg;
+    _oem_msg msg{};
     notify_t notifyType;
     float value;
 
@@ -111,12 +176,21 @@ void RawLightNotifier::notify() {
             value = response->data[0];
             switch (response->data[0]) {
                 case MI_DISP_POWER_ON:
+                    if (mCompensator != nullptr) {
+                        mCompensator->reset();
+                        mCompensator->setBacklight(readPanelBacklight());
+                    }
                     if (!isEnable) {
                         res = mQueue->enableSensor(mSensorHandle, 20000 /* sample period */,
                                                    0 /* latency */);
                         if (res != Result::OK) {
                             LOG(ERROR) << "failed to enable sensor";
-                        } else isEnable = true;
+                        } else {
+                            isEnable = true;
+                            if (mCwbClient != nullptr) {
+                                mCwbClient->start();
+                            }
+                        }
                     }
                     break;
                 default:
@@ -124,7 +198,15 @@ void RawLightNotifier::notify() {
                         res = mQueue->disableSensor(mSensorHandle);
                         if (res != Result::OK) {
                             LOG(ERROR) << "failed to disable sensor";
-                        } else isEnable = false;
+                        } else {
+                            isEnable = false;
+                        }
+                        if (mCwbClient != nullptr) {
+                            mCwbClient->stop();
+                        }
+                        if (mCompensator != nullptr) {
+                            mCompensator->reset();
+                        }
                     }
                     break;
             }
@@ -137,27 +219,38 @@ void RawLightNotifier::notify() {
                 case MI_DISP_EVENT_51_BRIGHTNESS:
                     notifyType = BRIGHTNESS;
                     value = *(uint16_t*)response->data;
+                    if (mCompensator != nullptr) {
+                        mCompensator->setBacklight(static_cast<uint32_t>(value));
+                    }
                     break;
                 case MI_DISP_EVENT_HBM:
                     notifyType = BRIGHTNESS;
                     value = response->data[0] ? -1 : -2;
+                    if (mCompensator != nullptr) {
+                        mCompensator->setHbmMode(response->data[0] != 0);
+                    }
                     break;
                 case MI_DISP_EVENT_DC:
                     notifyType = DC_STATE;
                     value = response->data[0];
+                    if (mCompensator != nullptr) {
+                        mCompensator->setDcMode(response->data[0] != 0);
+                    }
                     break;
                 default:
                     LOG(ERROR) << "got unknown event: " << response->base.type;
                     continue;
             }
         }
-        msg->sensorType = kSensorTypeAmbientlightRaw;
-        msg->notifyType = notifyType;
-        msg->notifyTypeFloat = notifyType;
-        msg->value = value;
-        msg->unknown1 = 1;
-        msg->unknown2 = 5;
 
-        SscCalApiWrapper::getInstance().processMsg(msg);
+        msg = {};
+        msg.sensorType = kSensorTypeAmbientlightRaw;
+        msg.notifyType = notifyType;
+        msg.notifyTypeFloat = static_cast<float>(notifyType);
+        msg.value = value;
+        msg.unknown1 = 1.0f;  // 1.0f = display event
+        msg.unknown2 = 5.0f;
+
+        SscCalApiWrapper::getInstance().processMsg(&msg);
     }
 }
