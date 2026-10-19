@@ -33,6 +33,9 @@ TARGET_USES_MFP_DAEMON := true
 # Light
 $(call soong_config_set,xiaomi_sm8450_sensor_notifier,extension_lib,//device/xiaomi/marble:libsensor-notifier-ext-light)
 
+PRODUCT_PACKAGES += \
+    udals_daemon
+
 # Logging
 SPAMMY_LOG_TAGS := \
     MiStcImpl \

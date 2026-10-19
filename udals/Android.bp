@@ -1,0 +1,32 @@
+//
+// Copyright (C) 2024-2026 The LineageOS Project
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+cc_binary {
+    name: "udals_daemon",
+    vendor: true,
+    srcs: [
+        "udals_daemon.cpp",
+    ],
+    shared_libs: [
+        "libbase",
+        "libdl",
+        "liblog",
+        "libnativewindow",
+        "libutils",
+    ],
+    header_libs: [
+        "libnativewindow_headers",
+    ],
+    init_rc: [
+        "udals_daemon.rc",
+    ],
+    cflags: [
+        "-Wall",
+        "-Werror",
+        "-Wextra",
+    ],
+    cpp_std: "c++20",
+}

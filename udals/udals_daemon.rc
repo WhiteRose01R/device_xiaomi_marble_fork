@@ -1,0 +1,16 @@
+#
+# Copyright (C) 2024-2026 The LineageOS Project
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+
+on post-fs
+    write /dev/udals_rgb ""
+    chown system graphics /dev/udals_rgb
+    chmod 0660 /dev/udals_rgb
+    restorecon /dev/udals_rgb
+
+service vendor.udals_daemon /vendor/bin/udals_daemon
+    class main
+    user system
+    group graphics
