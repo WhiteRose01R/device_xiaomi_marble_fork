@@ -90,7 +90,7 @@ void RawLightNotifier::notify() {
             .events = POLLIN,
     };
 
-    _oem_msg* msg = new _oem_msg;
+    _oem_msg msg{};
     notify_t notifyType;
     float value;
 
@@ -151,13 +151,14 @@ void RawLightNotifier::notify() {
                     continue;
             }
         }
-        msg->sensorType = kSensorTypeAmbientlightRaw;
-        msg->notifyType = notifyType;
-        msg->notifyTypeFloat = notifyType;
-        msg->value = value;
-        msg->unknown1 = 1;
-        msg->unknown2 = 5;
+        msg = {};
+        msg.sensorType = kSensorTypeAmbientlightRaw;
+        msg.notifyType = notifyType;
+        msg.notifyTypeFloat = static_cast<float>(notifyType);
+        msg.value = value;
+        msg.unknown1 = 1.0f;
+        msg.unknown2 = 5.0f;
 
-        SscCalApiWrapper::getInstance().processMsg(msg);
+        SscCalApiWrapper::getInstance().processMsg(&msg);
     }
 }

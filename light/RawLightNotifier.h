@@ -11,10 +11,10 @@
 class RawLightNotifier : public SensorNotifier {
   public:
     RawLightNotifier(sp<ISensorManager> manager);
-    ~RawLightNotifier();
+    ~RawLightNotifier() override;
 
   protected:
-    void notify();
+    void notify() override;
 
     bool isEnable;
 };
